@@ -27,6 +27,7 @@ BOSS_MAP = {
 
 # 国服四大区名称列表
 CN_DCS = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"]
+XIVAPI_V2_BASE_URL = "https://xivapi-v2.xivcdn.com"
 
 @register("fflogs_query", "YourName", "FF14 Logs与物价查询", "1.4.0")
 class FF14LogsPlugin(Star):
@@ -36,6 +37,22 @@ class FF14LogsPlugin(Star):
         self.token = None
         self.token_expiry = 0
 
+    def _get_proxy_url(self) -> str:
+        return self.config.get("proxy_url", "").strip()
+
+    def _create_http_client(self, timeout: float) -> httpx.AsyncClient:
+        proxy_url = self._get_proxy_url()
+        if not proxy_url:
+            return httpx.AsyncClient(timeout=timeout)
+        try:
+            return httpx.AsyncClient(timeout=timeout, proxy=proxy_url)
+        except TypeError:
+            return httpx.AsyncClient(timeout=timeout, proxies=proxy_url)
+
+    @staticmethod
+    def _xivapi_query_value(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
     # ========================== FFLogs 战绩部分 ==========================
     async def _get_token(self):
         cid = self.config.get("client_id", "").strip()
@@ -44,7 +61,7 @@ class FF14LogsPlugin(Star):
             raise ValueError("请在插件设置中填写正确的 Client ID 和 Secret。")
         
         url = "https://cn.fflogs.com/oauth/token"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with self._create_http_client(timeout=10.0) as client:
             res = await client.post(url, data={"grant_type": "client_credentials"}, auth=(cid, secret))
             res.raise_for_status()
             data = res.json()
@@ -77,7 +94,7 @@ class FF14LogsPlugin(Star):
             }
             """
             headers = {"Authorization": f"Bearer {self.token}"}
-            async with httpx.AsyncClient(timeout=25.0) as client:
+            async with self._create_http_client(timeout=25.0) as client:
                 payload = {"query": query, "variables": {"name": r_name, "server": s_name, "region": "CN"}}
                 res = await client.post("https://cn.fflogs.com/api/v2/client", json=payload, headers=headers)
                 if res.status_code == 401:
@@ -160,21 +177,30 @@ class FF14LogsPlugin(Star):
 
     # ========================== Universalis 查价部分 ==========================
     async def _search_item_id(self, item_name: str):
-        """利用国服版 XIVAPI (cafemaker) 模糊检索物品 ID"""
-        url = f"https://cafemaker.wakingsands.com/search?indexes=Item&string={urllib.parse.quote(item_name)}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        """利用国服版 XIVAPI v2 模糊检索物品 ID"""
+        url = f"{XIVAPI_V2_BASE_URL}/api/search"
+        params = {
+            "sheets": "Item",
+            "fields": "Name",
+            "query": f'Name~"{self._xivapi_query_value(item_name)}"',
+            "limit": 10,
+            "language": "chs",
+        }
+        async with self._create_http_client(timeout=10.0) as client:
             try:
-                res = await client.get(url)
+                res = await client.get(url, params=params)
                 if res.status_code == 200:
                     data = res.json()
-                    results = data.get("Results", [])
+                    results = data.get("results", [])
                     if results:
                         # 尝试精确匹配名字
                         for item in results:
-                            if item.get("Name", "").lower() == item_name.lower():
-                                return item.get("ID"), item.get("Name")
+                            name = item.get("fields", {}).get("Name", "")
+                            if name.lower() == item_name.lower():
+                                return item.get("row_id"), name
                         # 没有精确匹配就返回第一个搜索结果
-                        return results[0].get("ID"), results[0].get("Name")
+                        first = results[0]
+                        return first.get("row_id"), first.get("fields", {}).get("Name")
             except Exception as e:
                 logger.error(f"请求物品ID失败: {e}")
         return None, None
@@ -182,7 +208,7 @@ class FF14LogsPlugin(Star):
     async def _get_dc_lowest_price(self, item_id: int, dc: str):
         """请求单个大区的最低价 (listings=1 确保服务器只返回最便宜的那条数据)"""
         url = f"https://universalis.app/api/v2/{urllib.parse.quote(dc)}/{item_id}?listings=1"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with self._create_http_client(timeout=10.0) as client:
             try:
                 res = await client.get(url)
                 if res.status_code == 200:

@@ -10,5 +10,11 @@
     "type": "string",
     "hint": "在 https://www.fflogs.com/api/clients/ 获取",
     "default": ""
+  },
+  "proxy_url": {
+    "description": "插件请求代理地址",
+    "type": "string",
+    "hint": "可选。留空则不使用代理，例如 http://127.0.0.1:7890",
+    "default": ""
   }
 }
