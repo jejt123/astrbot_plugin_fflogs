@@ -28,6 +28,7 @@ BOSS_MAP = {
 # 国服四大区名称列表
 CN_DCS = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"]
 XIVAPI_V2_BASE_URL = "https://xivapi-v2.xivcdn.com"
+SERVER_STATUS_URL = "https://ff14act.web.sdo.com/api/serverStatus/getServerStatus"
 
 @register("fflogs_query", "YourName", "FF14 Logs与物价查询", "1.4.0")
 class FF14LogsPlugin(Star):
@@ -251,3 +252,64 @@ class FF14LogsPlugin(Star):
                 msg.append(f"[{dc}] 暂无在售")
 
         yield event.plain_result("\n".join(msg))
+
+    # ========================== 国服服务器状态部分 ==========================
+    @staticmethod
+    def _format_bool_status(enabled: bool, true_text: str, false_text: str) -> str:
+        return true_text if enabled else false_text
+
+    @staticmethod
+    def _format_preferred_status(server: dict) -> str:
+        if server.get("isnew", False):
+            return "优待状态: 特别优待"
+        if server.get("isupgrade", False):
+            return "优待状态: 优待"
+        return "优待状态: 普通"
+
+    def _format_server_status(self, data: list) -> str:
+        msg = ["🌐 国服服务器状态一览"]
+        for area in data:
+            area_name = area.get("AreaName", "未知大区")
+            servers = area.get("Group", [])
+            msg.append(f"\n【{area_name}】")
+            if not servers:
+                msg.append("  暂无服务器状态")
+                continue
+
+            for server in servers:
+                if server.get("iskong"):
+                    continue
+
+                name = server.get("name", "未知服务器")
+                statuses = [
+                    self._format_bool_status(server.get("runing", False), "运行中", "维护中"),
+                    self._format_bool_status(server.get("isint", False), "可转入", "不可转入"),
+                    self._format_bool_status(server.get("isout", False), "可转出", "不可转出"),
+                    self._format_bool_status(server.get("iscreate", False), "可创建新角色", "不可创建新角色"),
+                    self._format_preferred_status(server),
+                ]
+                msg.append(f"  {name}: {' / '.join(statuses)}")
+
+        return "\n".join(msg)
+
+    async def _do_server_status_query(self) -> str:
+        try:
+            async with self._create_http_client(timeout=10.0) as client:
+                res = await client.get(SERVER_STATUS_URL)
+                res.raise_for_status()
+                data = res.json()
+
+            if not data.get("IsSuccess"):
+                return f"❌ 获取服务器状态失败: {data.get('Errormsg') or '官网接口返回失败'}"
+
+            return self._format_server_status(data.get("Data", []))
+        except Exception as e:
+            logger.error(f"获取服务器状态失败: {e}", exc_info=True)
+            return f"❌ 获取服务器状态失败: {str(e)}"
+
+    @filter.command("ff14status")
+    async def cmd_ff14_status(self, event: AstrMessageEvent):
+        '''查询 FF14 国服服务器状态。用法: /ff14status'''
+        yield event.plain_result("🔍 正在获取国服服务器状态...")
+        result_msg = await self._do_server_status_query()
+        yield event.plain_result(result_msg)
