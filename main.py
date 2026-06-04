@@ -2,6 +2,9 @@ import httpx
 import time
 import asyncio
 import urllib.parse
+import re
+import html
+from datetime import datetime, timedelta
 from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger
@@ -29,6 +32,25 @@ BOSS_MAP = {
 CN_DCS = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"]
 XIVAPI_V2_BASE_URL = "https://xivapi-v2.xivcdn.com"
 SERVER_STATUS_URL = "https://ff14act.web.sdo.com/api/serverStatus/getServerStatus"
+NEWS_LIST_URL = "https://cqnews.web.sdo.com/api/news/newsList"
+NEWS_DETAIL_URL = "https://cqnews.web.sdo.com/api/news/newsDetail"
+NEWS_DETAIL_BASE_URL = "https://ff.web.sdo.com/web8/index.html#/newstab/newscont"
+NEWS_CATEGORY_CODES = "8324,8325,8326,8327,5309,5310,5311,5312,5313"
+MAINTENANCE_CATEGORY_CODE = "8324"
+MAINTENANCE_DONE_KEYWORDS = ("完成公告", "维护完成", "现已完成", "维护现已完成")
+IMPORTANT_MAINTENANCE_KEYWORDS = (
+    "全区全服更新维护公告",
+    "临时维护",
+    "停机维护",
+    "无法登录游戏",
+    "服务器临时维护",
+)
+LOW_IMPACT_MAINTENANCE_KEYWORDS = (
+    "调整维护",
+    "调整优化",
+    "网络线路调整",
+    "线路优化",
+)
 
 @register("fflogs_query", "YourName", "FF14 Logs与物价查询", "1.4.0")
 class FF14LogsPlugin(Star):
@@ -53,6 +75,91 @@ class FF14LogsPlugin(Star):
     @staticmethod
     def _xivapi_query_value(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def _get_news_count(self) -> int:
+        try:
+            count = int(self.config.get("news_count", 5))
+        except (TypeError, ValueError):
+            count = 5
+        return min(max(count, 1), 20)
+
+    def _show_low_impact_maintenance(self) -> bool:
+        value = self.config.get("show_low_impact_maintenance", False)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on", "是", "开启")
+        return bool(value)
+
+    @staticmethod
+    def _official_news_url(item: dict) -> str:
+        out_link = item.get("OutLink", "").strip()
+        if out_link:
+            return out_link
+        return f"{NEWS_DETAIL_BASE_URL}/{item.get('Id')}"
+
+    @staticmethod
+    def _plain_text_from_html(content: str) -> str:
+        text = re.sub(r"<br\s*/?>", "\n", content or "", flags=re.IGNORECASE)
+        text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text).replace("\xa0", " ")
+        return re.sub(r"[ \t]+", " ", text)
+
+    @staticmethod
+    def _parse_maintenance_time(text: str):
+        now = datetime.now()
+        time_range = re.search(
+            r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日\s*"
+            r"(\d{1,2}):(\d{2})\s*(?:-|~|—|至|到)\s*"
+            r"(?:(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日\s*)?"
+            r"(\d{1,2}):(\d{2})",
+            text,
+        )
+        if time_range:
+            (
+                start_year,
+                start_month,
+                start_day,
+                start_hour,
+                start_minute,
+                end_year,
+                end_month,
+                end_day,
+                end_hour,
+                end_minute,
+            ) = time_range.groups()
+            start_year = int(start_year or now.year)
+            start_month = int(start_month)
+            start_day = int(start_day)
+            end_year = int(end_year or start_year)
+            end_month = int(end_month or start_month)
+            end_day = int(end_day or start_day)
+            start_at = datetime(start_year, start_month, start_day, int(start_hour), int(start_minute))
+            end_at = datetime(end_year, end_month, end_day, int(end_hour), int(end_minute))
+            if end_at < start_at:
+                end_at += timedelta(days=1)
+            return start_at, end_at
+
+        date_range = re.search(
+            r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日\s*(?:至|到|-|~|—)\s*"
+            r"(?:(?:(\d{4})年)?(\d{1,2})月)?(\d{1,2})日",
+            text,
+        )
+        if date_range:
+            start_year, start_month, start_day, end_year, end_month, end_day = date_range.groups()
+            start_year = int(start_year or now.year)
+            start_month = int(start_month)
+            start_day = int(start_day)
+            end_year = int(end_year or start_year)
+            end_month = int(end_month or start_month)
+            start_at = datetime(start_year, start_month, start_day, 0, 0)
+            end_at = datetime(end_year, end_month, int(end_day), 23, 59, 59)
+            return start_at, end_at
+
+        return None, None
+
+    @staticmethod
+    def _format_dt(dt: datetime) -> str:
+        return dt.strftime("%Y-%m-%d %H:%M")
 
     # ========================== FFLogs 战绩部分 ==========================
     async def _get_token(self):
@@ -312,4 +419,159 @@ class FF14LogsPlugin(Star):
         '''查询 FF14 国服服务器状态。用法: /ff14status'''
         yield event.plain_result("🔍 正在获取国服服务器状态...")
         result_msg = await self._do_server_status_query()
+        yield event.plain_result(result_msg)
+
+    # ========================== 国服官网新闻与维护公告部分 ==========================
+    async def _fetch_news_list(self, category_codes: str, page_size: int, page_index: int = 0) -> list:
+        params = {
+            "gameCode": "ff",
+            "CategoryCode": category_codes,
+            "pageIndex": page_index,
+            "pageSize": page_size,
+        }
+        async with self._create_http_client(timeout=10.0) as client:
+            res = await client.get(NEWS_LIST_URL, params=params)
+            res.raise_for_status()
+            data = res.json()
+        if str(data.get("Code")) != "0":
+            raise ValueError(data.get("Message") or "官网新闻列表接口返回失败")
+        return data.get("Data", [])
+
+    async def _fetch_news_detail(self, news_id: int) -> dict:
+        params = {"gameCode": "ff", "id": news_id}
+        async with self._create_http_client(timeout=10.0) as client:
+            res = await client.get(NEWS_DETAIL_URL, params=params)
+            res.raise_for_status()
+            data = res.json()
+        if str(data.get("Code")) != "0":
+            raise ValueError(data.get("Message") or "官网新闻详情接口返回失败")
+        return data.get("Data", {})
+
+    def _format_news_list(self, items: list) -> str:
+        if not items:
+            return "📰 暂无官方新闻。"
+
+        msg = ["📰 最新官方情报"]
+        for index, item in enumerate(items, start=1):
+            publish_date = item.get("PublishDate", "").split(" ")[0].replace("/", "-")
+            title = item.get("Title", "未命名公告")
+            url = self._official_news_url(item)
+            msg.append(f"{index}. [{publish_date}] {title}\n{url}")
+        return "\n".join(msg)
+
+    async def _do_news_query(self) -> str:
+        try:
+            count = self._get_news_count()
+            items = await self._fetch_news_list(NEWS_CATEGORY_CODES, count)
+            return self._format_news_list(items[:count])
+        except Exception as e:
+            logger.error(f"获取官方新闻失败: {e}", exc_info=True)
+            return f"❌ 获取官方新闻失败: {str(e)}"
+
+    @staticmethod
+    def _is_maintenance_candidate(item: dict) -> bool:
+        title = item.get("Title", "")
+        summary = item.get("Summary", "")
+        text = f"{title} {summary}"
+        return "维护" in text and not any(keyword in text for keyword in MAINTENANCE_DONE_KEYWORDS)
+
+    @staticmethod
+    def _classify_maintenance_impact(text: str):
+        if any(keyword in text for keyword in IMPORTANT_MAINTENANCE_KEYWORDS):
+            return "important", "重点维护，可能影响登录"
+        if any(keyword in text for keyword in LOW_IMPACT_MAINTENANCE_KEYWORDS):
+            return "low", "网络/线路调整，通常只影响少部分用户"
+        return "general", "一般维护，可能影响部分功能"
+
+    def _build_maintenance_item(self, item: dict, detail: dict):
+        title = detail.get("Title") or item.get("Title", "未命名维护公告")
+        summary = detail.get("Summary") or item.get("Summary", "")
+        content_text = self._plain_text_from_html(detail.get("Content", ""))
+        all_text = f"{title}\n{summary}\n{content_text}"
+
+        if any(keyword in all_text for keyword in MAINTENANCE_DONE_KEYWORDS):
+            return None
+
+        start_at, end_at = self._parse_maintenance_time(all_text)
+        if not start_at or not end_at:
+            return None
+        if end_at and end_at < datetime.now():
+            return None
+
+        now = datetime.now()
+        status = "进行中" if start_at <= now <= end_at else "预定"
+        impact_level, impact_text = self._classify_maintenance_impact(all_text)
+
+        return {
+            "title": title,
+            "url": self._official_news_url(detail or item),
+            "status": status,
+            "impact_level": impact_level,
+            "impact_text": impact_text,
+            "start_at": start_at,
+            "end_at": end_at,
+            "publish_date": (detail.get("PublishDate") or item.get("PublishDate", "")).split(" ")[0].replace("/", "-"),
+        }
+
+    def _format_maintenance_list(self, items: list) -> str:
+        important_items = [item for item in items if item["impact_level"] == "important"]
+        general_items = [item for item in items if item["impact_level"] == "general"]
+        low_items = [item for item in items if item["impact_level"] == "low"]
+        show_low_impact = self._show_low_impact_maintenance()
+
+        if not important_items and not show_low_impact:
+            if general_items or low_items:
+                hidden_count = len(general_items) + len(low_items)
+                return f"🛠️ 当前没有影响登录的重点维护公告。\n已隐藏 {hidden_count} 条一般/低影响维护公告，可在插件配置中开启显示。"
+            return "🛠️ 当前没有正在进行中或已预定的重点维护公告。"
+
+        msg = ["🛠️ 当前重点维护公告"]
+        display_items = important_items
+        if show_low_impact:
+            display_items = important_items + general_items + low_items
+            msg = ["🛠️ 当前维护公告"]
+
+        if not display_items:
+            return "🛠️ 当前没有正在进行中或已预定的维护公告。"
+
+        for index, item in enumerate(display_items, start=1):
+            if item["start_at"] and item["end_at"]:
+                time_text = f"{self._format_dt(item['start_at'])} 至 {self._format_dt(item['end_at'])}"
+            else:
+                time_text = "详见公告"
+            msg.append(
+                f"{index}. [{item['status']}] {item['title']}\n"
+                f"影响: {item['impact_text']}\n"
+                f"时间: {time_text}\n"
+                f"{item['url']}"
+            )
+        return "\n".join(msg)
+
+    async def _do_maintenance_query(self) -> str:
+        try:
+            news_items = await self._fetch_news_list(MAINTENANCE_CATEGORY_CODE, 30)
+            candidates = [item for item in news_items if self._is_maintenance_candidate(item)]
+            results = []
+            for item in candidates:
+                detail = await self._fetch_news_detail(item.get("Id"))
+                maintenance = self._build_maintenance_item(item, detail)
+                if maintenance:
+                    results.append(maintenance)
+            return self._format_maintenance_list(results)
+        except Exception as e:
+            logger.error(f"获取维护公告失败: {e}", exc_info=True)
+            return f"❌ 获取维护公告失败: {str(e)}"
+
+    @filter.command("ff14news")
+    async def cmd_ff14_news(self, event: AstrMessageEvent):
+        '''查询 FF14 国服官网最新新闻。用法: /ff14news'''
+        yield event.plain_result("🔍 正在获取官方最新情报...")
+        result_msg = await self._do_news_query()
+        yield event.plain_result(result_msg)
+
+    @filter.command("ff14maint")
+    async def cmd_ff14_maintenance(self, event: AstrMessageEvent):
+        '''查询 FF14 国服维护公告。用法: /ff14maint'''
+        yield event.plain_result("🔍 正在获取官方维护公告...")
+        result_msg = await self._do_maintenance_query()
         yield event.plain_result(result_msg)
