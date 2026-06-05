@@ -18,15 +18,53 @@ JOB_MAP = {
     "BlackMage": "黑魔", "Summoner": "召唤", "RedMage": "赤魔", "Pictomancer": "画家"
 }
 
-BOSS_MAP = {
+SAVAGE_BOSS_MAP = {
     105: "M12S", 104: "M12S-门", 103: "M11S", 102: "M10S", 101: "M9S",
     100: "M8S", 99: "M7S", 98: "M6S", 97: "M5S",
     96: "M4S", 95: "M3S", 94: "M2S", 93: "M1S",
     92: "P12S", 91: "P11S", 90: "P10S", 89: "P9S", 
     87: "P8S", 86: "P7S", 85: "P6S", 84: "P5S",
     82: "P4S", 81: "P3S", 80: "P2S", 79: "P1S",
-    1077: "绝伊甸", 1068: "绝欧", 1065: "绝龙诗", 1062: "绝亚", 1061: "绝神兵", 1060: "绝巴哈"
 }
+
+ULTIMATE_BOSS_MAP = {
+    # 旧 zone 中的绝本 encounter id
+    1060: "绝巴哈",
+    1061: "绝神兵",
+    1062: "绝亚",
+    1065: "绝龙诗",
+    1068: "绝欧",
+    # 7.x Ultimates (Legacy) zone 中的旧绝本 encounter id
+    1073: "绝巴哈",
+    1074: "绝神兵",
+    1075: "绝亚",
+    1076: "绝龙诗",
+    1077: "绝欧",
+    # 7.x Futures Rewritten
+    1079: "绝伊甸",
+}
+
+BOSS_MAP = {**SAVAGE_BOSS_MAP, **ULTIMATE_BOSS_MAP}
+SAVAGE_ZONE_RANKINGS = (
+    ("s73", 73, "difficulty: 101"),
+    ("s68", 68, "difficulty: 101"),
+    ("s63", 63, "difficulty: 101"),
+    ("s54", 54, "difficulty: 101"),
+    ("s49", 49, "difficulty: 101"),
+    ("s44", 44, "difficulty: 101"),
+)
+ULTIMATE_ZONE_RANKINGS = (
+    ("u_fru", 65, ""),
+    ("u_7x_legacy", 59, ""),
+    ("u_6x", 62, ""),
+    ("u_5x", 53, ""),
+    ("u_4x", 45, ""),
+    ("u_3x", 43, ""),
+)
+FFLOGS_ZONE_RANKINGS = SAVAGE_ZONE_RANKINGS + ULTIMATE_ZONE_RANKINGS
+ULTIMATE_DISPLAY_ORDER = ["绝伊甸", "绝欧", "绝龙诗", "绝亚", "绝神兵", "绝巴哈"]
+SAVAGE_70_DISPLAY_ORDER = ["M12S", "M12S-门", "M11S", "M10S", "M9S", "M8S", "M7S", "M6S", "M5S", "M4S", "M3S", "M2S", "M1S"]
+SAVAGE_60_DISPLAY_ORDER = ["P12S", "P11S", "P10S", "P9S", "P8S", "P7S", "P6S", "P5S", "P4S", "P3S", "P2S", "P1S"]
 
 # 国服四大区名称列表
 CN_DCS = ["陆行鸟", "莫古力", "猫小胖", "豆豆柴"]
@@ -162,6 +200,16 @@ class FF14LogsPlugin(Star):
         return dt.strftime("%Y-%m-%d %H:%M")
 
     # ========================== FFLogs 战绩部分 ==========================
+    @staticmethod
+    def _build_zone_rankings_query() -> str:
+        lines = []
+        for alias, zone_id, extra_args in FFLOGS_ZONE_RANKINGS:
+            args = f"zoneID: {zone_id}"
+            if extra_args:
+                args = f"{args}, {extra_args}"
+            lines.append(f"                  {alias}: zoneRankings({args})")
+        return "\n".join(lines)
+
     async def _get_token(self):
         cid = self.config.get("client_id", "").strip()
         secret = self.config.get("client_secret", "").strip()
@@ -183,23 +231,15 @@ class FF14LogsPlugin(Star):
             if not self.token or time.time() > self.token_expiry:
                 await self._get_token()
 
-            query = """
-            query ($name: String, $server: String, $region: String) {
-              characterData {
-                character(name: $name, serverSlug: $server, serverRegion: $region) {
-                  s73: zoneRankings(zoneID: 73, difficulty: 101)
-                  s68: zoneRankings(zoneID: 68, difficulty: 101)
-                  s63: zoneRankings(zoneID: 63, difficulty: 101)
-                  s54: zoneRankings(zoneID: 54, difficulty: 101)
-                  s49: zoneRankings(zoneID: 49, difficulty: 101)
-                  s44: zoneRankings(zoneID: 44, difficulty: 101)
-                  u_6x: zoneRankings(zoneID: 62)
-                  u_5x: zoneRankings(zoneID: 53)
-                  u_4x: zoneRankings(zoneID: 45)
-                  u_3x: zoneRankings(zoneID: 43)
-                }
-              }
-            }
+            zone_rankings_query = self._build_zone_rankings_query()
+            query = f"""
+            query ($name: String, $server: String, $region: String) {{
+              characterData {{
+                character(name: $name, serverSlug: $server, serverRegion: $region) {{
+{zone_rankings_query}
+                }}
+              }}
+            }}
             """
             headers = {"Authorization": f"Bearer {self.token}"}
             async with self._create_http_client(timeout=25.0) as client:
@@ -237,18 +277,15 @@ class FF14LogsPlugin(Star):
                 return None
 
             msg.append("\n【绝境战】")
-            u_list = ["绝伊甸", "绝欧", "绝龙诗", "绝亚", "绝神兵", "绝巴哈"]
-            u_lines = [get_line(u) for u in u_list if get_line(u)]
+            u_lines = [get_line(u) for u in ULTIMATE_DISPLAY_ORDER if get_line(u)]
             msg.extend(u_lines if u_lines else ["  暂无记录"])
 
             msg.append("\n【7.0 阿卡狄亚】")
-            s70_list = ["M12S", "M12S-门", "M11S", "M10S", "M9S", "M8S", "M7S", "M6S", "M5S", "M4S", "M3S", "M2S", "M1S"]
-            s70_lines = [get_line(b) for b in s70_list if get_line(b)]
+            s70_lines = [get_line(b) for b in SAVAGE_70_DISPLAY_ORDER if get_line(b)]
             msg.extend(s70_lines if s70_lines else ["  暂无记录"])
 
             msg.append("\n【6.0 万魔殿】")
-            s60_all = ["P12S", "P11S", "P10S", "P9S", "P8S", "P7S", "P6S", "P5S", "P4S", "P3S", "P2S", "P1S"]
-            s60_lines = [get_line(b) for b in s60_all if get_line(b)]
+            s60_lines = [get_line(b) for b in SAVAGE_60_DISPLAY_ORDER if get_line(b)]
             msg.extend(s60_lines if s60_lines else ["  暂无记录"])
 
             return "\n".join(msg)
