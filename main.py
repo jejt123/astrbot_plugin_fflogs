@@ -42,9 +42,11 @@ ULTIMATE_BOSS_MAP = {
     1077: "绝欧",
     # 7.x Futures Rewritten
     1079: "绝伊甸",
+    # 7.x Dancing Mad
+    1085: "绝妖星乱舞",
 }
 
-BOSS_MAP = {**SAVAGE_BOSS_MAP, **ULTIMATE_BOSS_MAP}
+SAVAGE_DIFFICULTY_ID = 101
 SAVAGE_ZONE_RANKINGS = (
     ("s73", 73, "difficulty: 101"),
     ("s68", 68, "difficulty: 101"),
@@ -54,15 +56,16 @@ SAVAGE_ZONE_RANKINGS = (
     ("s44", 44, "difficulty: 101"),
 )
 ULTIMATE_ZONE_RANKINGS = (
+    ("u_dmu", 76, ""),
     ("u_fru", 65, ""),
     ("u_7x_legacy", 59, ""),
-    ("u_6x", 62, ""),
     ("u_5x", 53, ""),
     ("u_4x", 45, ""),
     ("u_3x", 43, ""),
 )
 FFLOGS_ZONE_RANKINGS = SAVAGE_ZONE_RANKINGS + ULTIMATE_ZONE_RANKINGS
-ULTIMATE_DISPLAY_ORDER = ["绝伊甸", "绝欧", "绝龙诗", "绝亚", "绝神兵", "绝巴哈"]
+SAVAGE_ZONE_ALIASES = {alias for alias, _, _ in SAVAGE_ZONE_RANKINGS}
+ULTIMATE_DISPLAY_ORDER = ["绝妖星乱舞", "绝伊甸", "绝欧", "绝龙诗", "绝亚", "绝神兵", "绝巴哈"]
 SAVAGE_70_DISPLAY_ORDER = ["M12S", "M12S-门", "M11S", "M10S", "M9S", "M8S", "M7S", "M6S", "M5S", "M4S", "M3S", "M2S", "M1S"]
 SAVAGE_60_DISPLAY_ORDER = ["P12S", "P11S", "P10S", "P9S", "P8S", "P7S", "P6S", "P5S", "P4S", "P3S", "P2S", "P1S"]
 
@@ -210,6 +213,47 @@ class FF14LogsPlugin(Star):
             lines.append(f"                  {alias}: zoneRankings({args})")
         return "\n".join(lines)
 
+    @staticmethod
+    def _get_difficulty_id(*payloads):
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+
+            difficulty = payload.get("difficulty")
+            if isinstance(difficulty, dict):
+                difficulty = difficulty.get("id") or difficulty.get("value")
+
+            for value in (
+                difficulty,
+                payload.get("difficultyID"),
+                payload.get("difficultyId"),
+            ):
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+
+        return None
+
+    def _get_ranking_display_name(self, alias: str, zone: dict, ranking: dict):
+        encounter_id = ranking.get("encounter", {}).get("id")
+
+        if encounter_id in SAVAGE_BOSS_MAP:
+            difficulty_id = self._get_difficulty_id(ranking, zone)
+            if alias not in SAVAGE_ZONE_ALIASES or difficulty_id != SAVAGE_DIFFICULTY_ID:
+                logger.debug(
+                    f"忽略非零式记录: alias={alias}, encounter={encounter_id}, difficulty={difficulty_id}"
+                )
+                return None
+            return SAVAGE_BOSS_MAP[encounter_id]
+
+        if encounter_id in ULTIMATE_BOSS_MAP:
+            return ULTIMATE_BOSS_MAP[encounter_id]
+
+        return None
+
     async def _get_token(self):
         cid = self.config.get("client_id", "").strip()
         secret = self.config.get("client_secret", "").strip()
@@ -256,18 +300,19 @@ class FF14LogsPlugin(Star):
                 return f"❌ 未找到角色: {r_name} @ {s_name}"
 
             results = {}
-            for zone in char.values():
+            for alias, zone in char.items():
                 if not zone or "rankings" not in zone: continue
                 for r in zone["rankings"]:
-                    bid = r.get("encounter", {}).get("id")
-                    if bid in BOSS_MAP:
-                        name = BOSS_MAP[bid]
-                        raw_p = r.get("rankPercent")
-                        percent = float(raw_p) if raw_p is not None else 0.0
-                        spec_name = r.get("spec", "")
-                        job = JOB_MAP.get(spec_name, spec_name)
-                        if name not in results or percent > results[name]['p']:
-                            results[name] = {"p": percent, "j": job}
+                    name = self._get_ranking_display_name(alias, zone, r)
+                    if not name:
+                        continue
+
+                    raw_p = r.get("rankPercent")
+                    percent = float(raw_p) if raw_p is not None else 0.0
+                    spec_name = r.get("spec", "")
+                    job = JOB_MAP.get(spec_name, spec_name)
+                    if name not in results or percent > results[name]['p']:
+                        results[name] = {"p": percent, "j": job}
 
             msg = [f"📊 FFLogs 战绩: {r_name} @ {s_name}"]
             def get_line(name):
